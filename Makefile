@@ -6,7 +6,7 @@ BASE_URL := http://127.0.0.1:8080
 list:
 	curl -sS $(BASE_URL)/notes
 
-create:
+post:
 	curl -sS -X POST $(BASE_URL)/notes -d 'Learn Zig'
 
 get:
