@@ -1,6 +1,6 @@
 BASE_URL := http://127.0.0.1:8080
 
-.PHONY: list create get update delete
+.PHONY: list post get update delete test perf-smoke perf-baseline perf-scaled
 
 
 list:
@@ -17,3 +17,16 @@ update:
 
 delete:
 	curl -sS -X DELETE $(BASE_URL)/notes/1
+
+test:
+	zig build test
+
+perf-smoke:
+	docker compose up --build --detach api
+	@status=0; docker compose --profile perf run --rm --no-deps k6 run /scripts/smoke.js || status=$$?; docker compose down --remove-orphans; exit $$status
+
+perf-baseline:
+	./perf/run.sh baseline
+
+perf-scaled:
+	./perf/run.sh scaled

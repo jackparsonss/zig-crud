@@ -3,6 +3,9 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const concurrent = b.option(bool, "concurrent", "Use the bounded concurrent worker pool") orelse true;
+    const options = b.addOptions();
+    options.addOption(bool, "concurrent", concurrent);
 
     const exe = b.addExecutable(.{
         .name = "zig_rest",
@@ -13,6 +16,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{},
         }),
     });
+    exe.root_module.addOptions("build_options", options);
 
     b.installArtifact(exe);
 
@@ -21,9 +25,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,

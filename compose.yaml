@@ -1,0 +1,28 @@
+services:
+  api:
+    build:
+      context: .
+      args:
+        CONCURRENT: ${CONCURRENT:-true}
+    ports:
+      - "8080:8080"
+    stop_grace_period: 1s
+    ulimits:
+      nofile:
+        soft: 20000
+        hard: 20000
+  k6:
+    image: grafana/k6:0.57.0
+    profiles: [perf]
+    depends_on:
+      - api
+    environment:
+      BASE_URL: http://api:8080
+    volumes:
+      - ./perf:/scripts:ro
+      - ./perf/results:/results
+    ulimits:
+      nofile:
+        soft: 20000
+        hard: 20000
+    entrypoint: [k6]

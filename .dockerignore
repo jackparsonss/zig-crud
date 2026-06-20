@@ -1,0 +1,7 @@
+.git
+.gitignore
+.zig-cache
+zig-cache
+zig-out
+graphify-out
+perf/results
