@@ -5,19 +5,9 @@ const Io = std.Io;
 const net = Io.net;
 const json = std.json;
 
-const max_connections = 12_000;
-const min_worker_count = 4;
-const max_worker_count = 128;
-const max_page_size = 100;
-
 const Note = struct {
     id: u32,
     text: []u8,
-};
-
-const Page = struct {
-    offset: usize = 0,
-    limit: usize = 20,
 };
 
 const App = struct {
@@ -25,7 +15,6 @@ const App = struct {
     notes: std.array_hash_map.Auto(u32, Note) = .empty,
     notes_lock: Io.RwLock = .init,
     next_id: u32 = 1,
-    active_connections: std.atomic.Value(usize) = .init(0),
 
     fn deinit(app: *App, io: Io) void {
         app.notes_lock.lockUncancelable(io);
@@ -35,18 +24,6 @@ const App = struct {
             app.allocator.free(note.text);
         }
         app.notes.deinit(app.allocator);
-    }
-
-    fn tryAcquireConnection(app: *App) bool {
-        const previous = app.active_connections.fetchAdd(1, .acq_rel);
-        if (previous < max_connections) return true;
-
-        _ = app.active_connections.fetchSub(1, .acq_rel);
-        return false;
-    }
-
-    fn releaseConnection(app: *App) void {
-        _ = app.active_connections.fetchSub(1, .acq_rel);
     }
 
     fn createNote(app: *App, io: Io, text: []const u8) !u32 {
@@ -73,20 +50,11 @@ const App = struct {
         return true;
     }
 
-    fn writeNotesJson(app: *App, io: Io, page: Page, body: *std.ArrayList(u8)) !void {
+    fn writeNotesJson(app: *App, io: Io, body: *std.ArrayList(u8)) !void {
         app.notes_lock.lockSharedUncancelable(io);
         defer app.notes_lock.unlockShared(io);
 
-        const notes = app.notes.values();
-        const start = @min(page.offset, notes.len);
-        const end = @min(start + page.limit, notes.len);
-
-        try body.append(app.allocator, '[');
-        for (notes[start..end], 0..) |note, index| {
-            if (index != 0) try body.append(app.allocator, ',');
-            try body.print(app.allocator, "{f}", .{json.fmt(note, .{})});
-        }
-        try body.append(app.allocator, ']');
+        try body.print(app.allocator, "{f}", .{json.fmt(app.notes.values(), .{})});
     }
 
     fn updateNote(app: *App, io: Io, id: u32, text: []const u8) !bool {
@@ -109,12 +77,6 @@ const App = struct {
         const note = app.notes.get(id) orelse return false;
         app.allocator.free(note.text);
         return app.notes.swapRemove(id);
-    }
-
-    fn count(app: *App, io: Io) usize {
-        app.notes_lock.lockSharedUncancelable(io);
-        defer app.notes_lock.unlockShared(io);
-        return app.notes.count();
     }
 };
 
@@ -141,7 +103,6 @@ const WorkerPool = struct {
             allocator.destroy(pool);
         }
 
-        try pool.queue.ensureTotalCapacity(allocator, max_connections);
         pool.threads = try allocator.alloc(std.Thread, worker_count);
 
         for (pool.threads) |*thread| {
@@ -170,19 +131,17 @@ const WorkerPool = struct {
 
         for (pool.queue.items) |stream| {
             stream.close(pool.io);
-            pool.app.releaseConnection();
         }
         pool.queue.deinit(pool.allocator);
     }
 
-    fn enqueue(pool: *WorkerPool, stream: net.Stream) bool {
+    fn enqueue(pool: *WorkerPool, stream: net.Stream) !void {
         pool.mutex.lockUncancelable(pool.io);
         defer pool.mutex.unlock(pool.io);
 
-        if (pool.stopping or pool.queue.items.len == max_connections) return false;
-        pool.queue.appendAssumeCapacity(stream);
+        if (pool.stopping) return error.WorkerPoolStopping;
+        try pool.queue.append(pool.allocator, stream);
         pool.condition.signal(pool.io);
-        return true;
     }
 
     fn take(pool: *WorkerPool) ?net.Stream {
@@ -208,41 +167,29 @@ pub fn main(init: std.process.Init) !void {
     defer app.deinit(init.io);
 
     const cpu_count = std.Thread.getCpuCount() catch 1;
-    const worker_count = if (build_options.concurrent)
-        @min(@max(cpu_count * 4, min_worker_count), max_worker_count)
-    else
-        1;
+    const worker_count = if (build_options.concurrent) cpu_count else 1;
     const workers = try WorkerPool.init(init.gpa, init.io, &app, worker_count);
     defer workers.destroy();
 
-    try runServer(init.io, &app, workers, worker_count);
+    try runServer(init.io, workers, worker_count);
 }
 
-fn runServer(io: Io, app: *App, workers: *WorkerPool, worker_count: usize) !void {
+fn runServer(io: Io, workers: *WorkerPool, worker_count: usize) !void {
     const address = try net.IpAddress.parse("0.0.0.0", 8080);
-    var server = try address.listen(io, .{
-        .reuse_address = true,
-        .kernel_backlog = 16_384,
-    });
+    var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
     std.debug.print("Listening on http://0.0.0.0:8080 with {d} workers\n", .{worker_count});
 
     while (true) {
         const stream = try server.accept(io);
-        if (!app.tryAcquireConnection()) {
+        workers.enqueue(stream) catch {
             stream.close(io);
-            continue;
-        }
-        if (!workers.enqueue(stream)) {
-            app.releaseConnection();
-            stream.close(io);
-        }
+        };
     }
 }
 
 fn handleConnection(io: Io, stream: net.Stream, app: *App) void {
-    defer app.releaseConnection();
     defer stream.close(io);
 
     var read_buffer: [4096]u8 = undefined;
@@ -268,15 +215,12 @@ fn handleConnection(io: Io, stream: net.Stream, app: *App) void {
 }
 
 fn route(request: *std.http.Server.Request, io: Io, app: *App) !void {
-    const target = request.head.target;
-    const query_start = std.mem.indexOfScalar(u8, target, '?');
-    const path = target[0..(query_start orelse target.len)];
-    const query = if (query_start) |start| target[start + 1 ..] else "";
     const method = request.head.method;
+    const path = request.head.target;
 
     if (std.mem.eql(u8, path, "/notes")) {
         return switch (method) {
-            .GET => listNotes(request, io, app, query),
+            .GET => listNotes(request, io, app),
             .POST => createNote(request, io, app),
             else => respondJson(request, .method_not_allowed, "{\"error\":\"method not allowed\"}"),
         };
@@ -299,14 +243,10 @@ fn route(request: *std.http.Server.Request, io: Io, app: *App) !void {
     return respondJson(request, .not_found, "{\"error\":\"not found\"}");
 }
 
-fn listNotes(request: *std.http.Server.Request, io: Io, app: *App, query: []const u8) !void {
-    const page = parsePage(query) catch {
-        return respondJson(request, .bad_request, "{\"error\":\"invalid pagination\"}");
-    };
-
+fn listNotes(request: *std.http.Server.Request, io: Io, app: *App) !void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(app.allocator);
-    try app.writeNotesJson(io, page, &body);
+    try app.writeNotesJson(io, &body);
     try respondJson(request, .ok, body.items);
 }
 
@@ -322,10 +262,7 @@ fn getNote(request: *std.http.Server.Request, io: Io, app: *App, id: u32) !void 
 }
 
 fn createNote(request: *std.http.Server.Request, io: Io, app: *App) !void {
-    const text = readBody(request, app.allocator) catch |err| switch (err) {
-        error.BodyTooLarge => return respondJson(request, .payload_too_large, "{\"error\":\"request body is too large\"}"),
-        else => return err,
-    };
+    const text = try readBody(request, app.allocator);
     defer app.allocator.free(text);
 
     if (text.len == 0) {
@@ -340,10 +277,7 @@ fn createNote(request: *std.http.Server.Request, io: Io, app: *App) !void {
 }
 
 fn updateNote(request: *std.http.Server.Request, io: Io, app: *App, id: u32) !void {
-    const text = readBody(request, app.allocator) catch |err| switch (err) {
-        error.BodyTooLarge => return respondJson(request, .payload_too_large, "{\"error\":\"request body is too large\"}"),
-        else => return err,
-    };
+    const text = try readBody(request, app.allocator);
     defer app.allocator.free(text);
 
     if (text.len == 0) {
@@ -368,35 +302,8 @@ fn deleteNote(request: *std.http.Server.Request, io: Io, app: *App, id: u32) !vo
     try respondJson(request, .ok, "{\"deleted\":true}");
 }
 
-fn parsePage(query: []const u8) !Page {
-    if (query.len == 0) return .{};
-
-    var page = Page{};
-    var seen_offset = false;
-    var seen_limit = false;
-    var fields = std.mem.splitScalar(u8, query, '&');
-    while (fields.next()) |field| {
-        const separator = std.mem.indexOfScalar(u8, field, '=') orelse return error.InvalidPagination;
-        const key = field[0..separator];
-        const value = field[separator + 1 ..];
-
-        if (std.mem.eql(u8, key, "offset") and !seen_offset) {
-            page.offset = std.fmt.parseInt(usize, value, 10) catch return error.InvalidPagination;
-            seen_offset = true;
-        } else if (std.mem.eql(u8, key, "limit") and !seen_limit) {
-            page.limit = std.fmt.parseInt(usize, value, 10) catch return error.InvalidPagination;
-            if (page.limit == 0 or page.limit > max_page_size) return error.InvalidPagination;
-            seen_limit = true;
-        } else {
-            return error.InvalidPagination;
-        }
-    }
-    return page;
-}
-
 fn readBody(request: *std.http.Server.Request, allocator: std.mem.Allocator) ![]u8 {
     const length = request.head.content_length orelse return allocator.dupe(u8, "");
-    if (length > 1024) return error.BodyTooLarge;
 
     var body_buffer: [1024]u8 = undefined;
     var reader = try request.readerExpectContinue(&body_buffer);

@@ -14,19 +14,11 @@ The server listens on `http://127.0.0.1:8080` and also accepts connections on
 the container-friendly `0.0.0.0:8080` bind address. Notes are intentionally
 in-memory and are discarded at restart.
 
-`GET /notes` supports bounded pagination:
-
-```sh
-curl 'http://127.0.0.1:8080/notes?offset=0&limit=20'
-```
-
-`limit` must be between 1 and 100.
-
 ## Scaling benchmark
 
-The Compose setup builds with Zig `0.17.0-dev.902`, starts the API with a
-20,000-file-descriptor limit, and runs k6 on the same Docker host. The k6
-workload gives every virtual user its own create/read/update/read/delete cycle.
+The Compose setup builds with Zig `0.17.0-dev.902` and runs k6 on the same
+Docker host. The workload gives every virtual user its own
+create/read/update/read/delete cycle.
 
 ```sh
 make perf-baseline

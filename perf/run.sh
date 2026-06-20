@@ -51,7 +51,7 @@ mkdir -p "$result_dir"
 
 wait_for_api() {
   for _ in $(seq 1 30); do
-    if curl --fail --silent --output /dev/null "http://127.0.0.1:8080/notes?limit=1"; then
+    if curl --fail --silent --output /dev/null "http://127.0.0.1:8080/notes"; then
       return 0
     fi
     sleep 1
