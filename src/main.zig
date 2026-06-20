@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Io = std.Io;
 const net = Io.net;
+const json = std.json;
 
 const Note = struct {
     id: u32,
@@ -124,12 +125,7 @@ fn listNotes(request: *std.http.Server.Request, app: *App) !void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(app.allocator);
 
-    try body.append(app.allocator, '[');
-    for (app.notes.items, 0..) |note, index| {
-        if (index > 0) try body.appendSlice(app.allocator, ",");
-        try appendNoteJson(&body, app.allocator, note);
-    }
-    try body.append(app.allocator, ']');
+    try body.print(app.allocator, "{f}", .{json.fmt(app.notes.items, .{})});
 
     try respondJson(request, .ok, body.items);
 }
@@ -141,7 +137,7 @@ fn getNote(request: *std.http.Server.Request, app: *App, id: u32) !void {
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(app.allocator);
-    try appendNoteJson(&body, app.allocator, note.*);
+    try body.print(app.allocator, "{f}", .{json.fmt(note.*, .{})});
 
     try respondJson(request, .ok, body.items);
 }
@@ -158,7 +154,7 @@ fn createNote(request: *std.http.Server.Request, app: *App) !void {
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(app.allocator);
-    try appendNoteJson(&body, app.allocator, note);
+    try body.print(app.allocator, "{f}", .{json.fmt(note, .{})});
 
     try respondJson(request, .created, body.items);
 }
@@ -180,7 +176,7 @@ fn updateNote(request: *std.http.Server.Request, app: *App, id: u32) !void {
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(app.allocator);
-    try appendNoteJson(&body, app.allocator, note.*);
+    try body.print(app.allocator, "{f}", .{json.fmt(note.*, .{})});
 
     try respondJson(request, .ok, body.items);
 }
@@ -200,33 +196,6 @@ fn readBody(request: *std.http.Server.Request, allocator: std.mem.Allocator) ![]
     var body_buffer: [1024]u8 = undefined;
     var reader = try request.readerExpectContinue(&body_buffer);
     return reader.readAlloc(allocator, @intCast(length));
-}
-
-fn appendNoteJson(
-    body: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    note: Note,
-) !void {
-    try body.print(allocator, "{{\"id\":{d},\"text\":\"", .{note.id});
-    try appendJsonString(body, allocator, note.text);
-    try body.appendSlice(allocator, "\"}");
-}
-
-fn appendJsonString(
-    body: *std.ArrayList(u8),
-    allocator: std.mem.Allocator,
-    text: []const u8,
-) !void {
-    for (text) |byte| {
-        switch (byte) {
-            '\\' => try body.appendSlice(allocator, "\\\\"),
-            '"' => try body.appendSlice(allocator, "\\\""),
-            '\n' => try body.appendSlice(allocator, "\\n"),
-            '\r' => try body.appendSlice(allocator, "\\r"),
-            '\t' => try body.appendSlice(allocator, "\\t"),
-            else => try body.append(allocator, byte),
-        }
-    }
 }
 
 fn respondJson(
