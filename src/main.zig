@@ -1,4 +1,5 @@
 const std = @import("std");
+const pg = @import("pg");
 
 const Io = std.Io;
 const net = Io.net;
@@ -6,58 +7,38 @@ const json = std.json;
 
 const Note = struct {
     id: u32,
-    text: []u8,
+    text: []const u8,
 };
 
 const App = struct {
     allocator: std.mem.Allocator,
-    notes: std.ArrayList(Note) = .empty,
-    next_id: u32 = 1,
-
-    fn deinit(app: *App) void {
-        for (app.notes.items) |note| {
-            app.allocator.free(note.text);
-        }
-        app.notes.deinit(app.allocator);
-    }
-
-    fn createNote(app: *App, text: []const u8) !Note {
-        const note: Note = .{
-            .id = app.next_id,
-            .text = try app.allocator.dupe(u8, text),
-        };
-        app.next_id += 1;
-        try app.notes.append(app.allocator, note);
-        return note;
-    }
-
-    fn findNote(app: *App, id: u32) ?*Note {
-        for (app.notes.items) |*note| {
-            if (note.id == id) return note;
-        }
-        return null;
-    }
-
-    fn deleteNote(app: *App, id: u32) bool {
-        for (app.notes.items, 0..) |note, index| {
-            if (note.id == id) {
-                app.allocator.free(note.text);
-                _ = app.notes.orderedRemove(index);
-                return true;
-            }
-        }
-        return false;
-    }
+    pool: *pg.Pool,
 };
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    var app: App = .{ .allocator = init.gpa };
-    defer app.deinit();
+
+    var pool = try pg.Pool.init(io, init.gpa, .{
+        .size = 5,
+        .connect = .{ .host = "127.0.0.1", .port = 5432 },
+        .auth = .{
+            .username = "postgres",
+            .password = "postgres",
+            .database = "notes",
+        },
+    });
+    defer pool.deinit();
+
+    var app: App = .{
+        .allocator = init.gpa,
+        .pool = pool,
+    };
 
     const address = try net.IpAddress.parse("127.0.0.1", 8080);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
+
+    _ = try pool.exec(@embedFile("sql/create_notes_table.sql"), .{});
 
     std.debug.print("Listening on http://127.0.0.1:8080\n", .{});
 
@@ -122,70 +103,63 @@ fn route(request: *std.http.Server.Request, app: *App) !void {
 }
 
 fn listNotes(request: *std.http.Server.Request, app: *App) !void {
+    var result = try app.pool.query(@embedFile("sql/list_notes.sql"), .{});
+    defer result.deinit();
+
+    var notes: std.ArrayList(Note) = .empty;
+    defer notes.deinit(app.allocator);
+
+    while (try result.next()) |row| {
+        const id: u32 = @intCast(try row.get(i32, 0));
+        try notes.append(app.allocator, .{ .id = id, .text = try row.get([]const u8, 1) });
+    }
+
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(app.allocator);
-
-    try body.print(app.allocator, "{f}", .{json.fmt(app.notes.items, .{})});
-
+    try body.print(app.allocator, "{f}", .{json.fmt(notes.items, .{})});
     try respondJson(request, .ok, body.items);
 }
 
 fn getNote(request: *std.http.Server.Request, app: *App, id: u32) !void {
-    const note = app.findNote(id) orelse {
+    var row = (try app.pool.row(@embedFile("sql/get_note.sql"), .{id})) orelse {
         return respondJson(request, .not_found, "{\"error\":\"note not found\"}");
     };
+    defer row.deinit() catch {};
 
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(app.allocator);
-    try body.print(app.allocator, "{f}", .{json.fmt(note.*, .{})});
-
-    try respondJson(request, .ok, body.items);
+    try respondNote(request, app, &row, .ok);
 }
 
 fn createNote(request: *std.http.Server.Request, app: *App) !void {
     const text = try readBody(request, app.allocator);
     defer app.allocator.free(text);
+    if (text.len == 0) return respondJson(request, .bad_request, "{\"error\":\"request body is empty\"}");
 
-    if (text.len == 0) {
-        return respondJson(request, .bad_request, "{\"error\":\"request body is empty\"}");
-    }
+    var row = (try app.pool.row(@embedFile("sql/create_note.sql"), .{text})) orelse return error.QueryFailed;
+    defer row.deinit() catch {};
 
-    const note = try app.createNote(text);
-
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(app.allocator);
-    try body.print(app.allocator, "{f}", .{json.fmt(note, .{})});
-
-    try respondJson(request, .created, body.items);
+    try respondNote(request, app, &row, .created);
 }
 
 fn updateNote(request: *std.http.Server.Request, app: *App, id: u32) !void {
-    const note = app.findNote(id) orelse {
-        return respondJson(request, .not_found, "{\"error\":\"note not found\"}");
-    };
-
     const text = try readBody(request, app.allocator);
     defer app.allocator.free(text);
-
     if (text.len == 0) {
         return respondJson(request, .bad_request, "{\"error\":\"request body is empty\"}");
     }
 
-    app.allocator.free(note.text);
-    note.text = try app.allocator.dupe(u8, text);
+    var row = (try app.pool.row(@embedFile("sql/update_note.sql"), .{ text, id })) orelse {
+        return respondJson(request, .not_found, "{\"error\":\"note not found\"}");
+    };
+    defer row.deinit() catch {};
 
-    var body: std.ArrayList(u8) = .empty;
-    defer body.deinit(app.allocator);
-    try body.print(app.allocator, "{f}", .{json.fmt(note.*, .{})});
-
-    try respondJson(request, .ok, body.items);
+    try respondNote(request, app, &row, .ok);
 }
 
 fn deleteNote(request: *std.http.Server.Request, app: *App, id: u32) !void {
-    if (!app.deleteNote(id)) {
+    const affected = try app.pool.exec(@embedFile("sql/delete_note.sql"), .{id});
+    if ((affected orelse 0) == 0) {
         return respondJson(request, .not_found, "{\"error\":\"note not found\"}");
     }
-
     try respondJson(request, .ok, "{\"deleted\":true}");
 }
 
@@ -209,4 +183,19 @@ fn respondJson(
             .{ .name = "content-type", .value = "application/json" },
         },
     });
+}
+
+fn respondNote(
+    request: *std.http.Server.Request,
+    app: *App,
+    row: *pg.QueryRow,
+    status: std.http.Status,
+) !void {
+    const id: u32 = @intCast(try row.get(i32, 0));
+    const note: Note = .{ .id = id, .text = try row.get([]const u8, 1) };
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(app.allocator);
+    try body.print(app.allocator, "{f}", .{json.fmt(note, .{})});
+    try respondJson(request, status, body.items);
 }

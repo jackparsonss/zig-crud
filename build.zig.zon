@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x357ec233a795febd, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .pg = .{
+            .url = "git+https://github.com/karlseguin/pg.zig?ref=master#6884ec9703e541001825c48829d70115c515080b",
+            .hash = "pg-0.0.0-Wp_7gbj_BgAb_T9wVKymIKU30RJKSr1pznch2S71RV3-",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

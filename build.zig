@@ -4,13 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const pg_module = b.dependency("pg", .{}).module("pg");
+
     const exe = b.addExecutable(.{
         .name = "zig_rest",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{},
+            .imports = &.{
+                .{ .name = "pg", .module = pg_module },
+            },
         }),
     });
 
