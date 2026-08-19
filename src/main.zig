@@ -1,6 +1,9 @@
 const std = @import("std");
 const pg = @import("pg");
 
+const auth = @import("auth.zig");
+const jwt = @import("jwt.zig");
+
 const Io = std.Io;
 const net = Io.net;
 const json = std.json;
@@ -13,10 +16,27 @@ const Note = struct {
 const App = struct {
     allocator: std.mem.Allocator,
     pool: *pg.Pool,
+    io: std.Io,
+    jwt_secret: []const u8,
+};
+
+const User = struct {
+    username: []const u8,
+    password: []const u8,
 };
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
+
+    const jwt_secret = init.environ_map.get("JWT_SECRET") orelse {
+        std.debug.print("JWT_SECRET env variable is required", .{});
+        return error.MissingJWTSecret;
+    };
+
+    if (jwt_secret.len == 0) {
+        std.debug.print("JWT_SECRET env variable must be not empty", .{});
+        return error.MissingJWTSecret;
+    }
 
     var pool = try pg.Pool.init(io, init.gpa, .{
         .size = 5,
@@ -32,6 +52,8 @@ pub fn main(init: std.process.Init) !void {
     var app: App = .{
         .allocator = init.gpa,
         .pool = pool,
+        .io = io,
+        .jwt_secret = jwt_secret,
     };
 
     const address = try net.IpAddress.parse("127.0.0.1", 8080);
@@ -39,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
     defer server.deinit(io);
 
     _ = try pool.exec(@embedFile("sql/create_notes_table.sql"), .{});
+    _ = try pool.exec(@embedFile("sql/create_users_table.sql"), .{});
 
     std.debug.print("Listening on http://127.0.0.1:8080\n", .{});
 
@@ -77,6 +100,35 @@ fn route(request: *std.http.Server.Request, app: *App) !void {
     const method = request.head.method;
     const path = request.head.target;
 
+    if (std.mem.eql(u8, path, "/user")) {
+        return switch (method) {
+            .POST => createUser(request, app),
+            else => respondJson(
+                request,
+                .method_not_allowed,
+                "{\"error\":\"method not allowed\"}",
+            ),
+        };
+    }
+
+    if (std.mem.eql(u8, path, "/login")) {
+        return switch (method) {
+            .POST => login(request, app),
+            else => respondJson(
+                request,
+                .method_not_allowed,
+                "{\"error\":\"method not allowed\"}",
+            ),
+        };
+    }
+
+    const token = bearerToken(request) orelse
+        return respondUnauthorized(request);
+
+    const now = Io.Clock.real.now(app.io).toSeconds();
+    jwt.verifyToken(app.allocator, app.jwt_secret, token, now) catch
+        return respondUnauthorized(request);
+
     if (std.mem.eql(u8, path, "/notes")) {
         return switch (method) {
             .GET => listNotes(request, app),
@@ -100,6 +152,165 @@ fn route(request: *std.http.Server.Request, app: *App) !void {
     }
 
     return respondJson(request, .not_found, "{\"error\":\"not found\"}");
+}
+
+fn createUser(request: *std.http.Server.Request, app: *App) !void {
+    const body = readBody(request, app.allocator) catch |err| switch (err) {
+        error.BodyTooLarge => return respondJson(
+            request,
+            .payload_too_large,
+            "{\"error\":\"request body is too large\"}",
+        ),
+        else => return err,
+    };
+    defer app.allocator.free(body);
+
+    const parsed = json.parseFromSlice(User, app.allocator, body, .{}) catch {
+        return respondJson(
+            request,
+            .bad_request,
+            "{\"error\":\"invalid credentials payload\"}",
+        );
+    };
+    defer parsed.deinit();
+
+    const credentials = parsed.value;
+    if (credentials.username.len == 0 or credentials.password.len == 0) {
+        return respondJson(
+            request,
+            .bad_request,
+            "{\"error\":\"username and password are required\"}",
+        );
+    }
+
+    var password_hash_buffer: [auth.password_hash_buffer_size]u8 = undefined;
+    const password_hash = try auth.hashPassword(
+        app.allocator,
+        app.io,
+        credentials.password,
+        &password_hash_buffer,
+    );
+
+    var row = (try app.pool.row(
+        @embedFile("sql/create_user.sql"),
+        .{ credentials.username, password_hash },
+    )) orelse {
+        return respondJson(
+            request,
+            .conflict,
+            "{\"error\":\"username already exists\"}",
+        );
+    };
+    defer row.deinit() catch {};
+
+    const username = try row.get([]const u8, 0);
+    var response: std.ArrayList(u8) = .empty;
+    defer response.deinit(app.allocator);
+    try response.print(app.allocator, "{f}", .{json.fmt(.{ .username = username }, .{})});
+
+    try respondJson(request, .created, response.items);
+}
+
+fn login(request: *std.http.Server.Request, app: *App) !void {
+    const body = readBody(request, app.allocator) catch |err| switch (err) {
+        error.BodyTooLarge => return respondJson(
+            request,
+            .payload_too_large,
+            "{\"error\":\"request body is too large\"}",
+        ),
+        else => return err,
+    };
+    defer app.allocator.free(body);
+
+    const parsed = json.parseFromSlice(User, app.allocator, body, .{}) catch {
+        return respondJson(
+            request,
+            .bad_request,
+            "{\"error\":\"invalid credentials payload\"}",
+        );
+    };
+    defer parsed.deinit();
+
+    const credentials = parsed.value;
+    if (credentials.username.len == 0 or credentials.password.len == 0) {
+        return respondJson(
+            request,
+            .bad_request,
+            "{\"error\":\"username and password are required\"}",
+        );
+    }
+
+    var row = (try app.pool.row(
+        @embedFile("sql/get_user.sql"),
+        .{credentials.username},
+    )) orelse return respondInvalidUser(request);
+    defer row.deinit() catch {};
+
+    const password_hash = try row.get([]const u8, 0);
+    if (!auth.verifyPassword(app.allocator, app.io, password_hash, credentials.password)) {
+        return respondInvalidUser(request);
+    }
+
+    const now = Io.Clock.real.now(app.io).toSeconds();
+    const token = try jwt.issueToken(
+        app.allocator,
+        app.jwt_secret,
+        credentials.username,
+        now,
+    );
+    defer app.allocator.free(token);
+
+    var response: std.ArrayList(u8) = .empty;
+    defer response.deinit(app.allocator);
+    try response.print(app.allocator, "{f}", .{json.fmt(.{
+        .token = token,
+        .toke_type = "Bearer",
+        .expires_in = jwt.token_lifetime_seconds,
+    }, .{})});
+
+    try respondJson(request, .ok, response.items);
+}
+
+fn bearerToken(request: *const std.http.Server.Request) ?[]const u8 {
+    var token: ?[]const u8 = null;
+    var headers = request.iterateHeaders();
+
+    const bearer_len = "Bearer ".len;
+    while (headers.next()) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "authorization")) {
+            continue;
+        }
+
+        if (token != null) {
+            return null;
+        }
+
+        if (header.value.len <= bearer_len or
+            !std.ascii.eqlIgnoreCase(header.value[0..bearer_len], "Bearer "))
+        {
+            return null;
+        }
+        token = header.value[bearer_len..];
+    }
+    return token;
+}
+
+fn respondInvalidUser(request: *std.http.Server.Request) !void {
+    try respondJson(
+        request,
+        .unauthorized,
+        "{\"error\":\"invalid username or password\"}",
+    );
+}
+
+fn respondUnauthorized(request: *std.http.Server.Request) !void {
+    try request.respond("{\"error\":\"authentication required\"}", .{
+        .status = .unauthorized,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "www-authenticate", .value = "Bearer" },
+        },
+    });
 }
 
 fn listNotes(request: *std.http.Server.Request, app: *App) !void {
