@@ -126,8 +126,16 @@ fn route(request: *std.http.Server.Request, app: *App) !void {
         return respondUnauthorized(request);
 
     const now = Io.Clock.real.now(app.io).toSeconds();
-    jwt.verifyToken(app.allocator, app.jwt_secret, token, now) catch
+    const claims = jwt.verifyToken(app.allocator, app.jwt_secret, token, now) catch
         return respondUnauthorized(request);
+    defer app.allocator.free(claims.sub);
+
+    if (std.mem.eql(u8, path, "/whoami")) {
+        return switch (method) {
+            .GET => whoami(request, app, claims),
+            else => respondJson(request, .method_not_allowed, "{\"error\":\"method not allowed\"}"),
+        };
+    }
 
     if (std.mem.eql(u8, path, "/notes")) {
         return switch (method) {
@@ -271,6 +279,19 @@ fn login(request: *std.http.Server.Request, app: *App) !void {
     try respondJson(request, .ok, response.items);
 }
 
+/// Returns the claims of the caller's token. Needs no database.
+fn whoami(request: *std.http.Server.Request, app: *App, claims: jwt.Claims) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(app.allocator);
+    try body.print(app.allocator, "{f}", .{json.fmt(.{
+        .username = claims.sub,
+        .issued_at = claims.iat,
+        .expires_at = claims.exp,
+    }, .{})});
+
+    try respondJson(request, .ok, body.items);
+}
+
 fn bearerToken(request: *const std.http.Server.Request) ?[]const u8 {
     var token: ?[]const u8 = null;
     var headers = request.iterateHeaders();
@@ -409,4 +430,8 @@ fn respondNote(
     defer body.deinit(app.allocator);
     try body.print(app.allocator, "{f}", .{json.fmt(note, .{})});
     try respondJson(request, status, body.items);
+}
+
+test {
+    _ = jwt;
 }

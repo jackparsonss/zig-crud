@@ -29,6 +29,13 @@ curl -sS http://127.0.0.1:8080/notes \
   -H "authorization: Bearer $TOKEN"
 ```
 
+`GET /whoami` returns the token's claims without touching the database:
+
+```sh
+curl -sS http://127.0.0.1:8080/whoami \
+  -H "authorization: Bearer $TOKEN"
+```
+
 Tokens expire after one hour. `JWT_SECRET` is required when the application
 starts. The Dockerfile supplies `super-secret` as a development default; it
 must be overridden with a strong secret in production.

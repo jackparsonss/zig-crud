@@ -13,7 +13,7 @@ const Header = struct {
     typ: []const u8,
 };
 
-const Claims = struct {
+pub const Claims = struct {
     sub: []const u8,
     iat: i64,
     exp: i64,
@@ -37,12 +37,14 @@ pub fn issueToken(
     return createToken(allocator, secret, jwt_header, payload.items);
 }
 
+/// Verifies `token` and returns its claims. The returned `sub` is allocated
+/// with `allocator` and owned by the caller.
 pub fn verifyToken(
     allocator: Allocator,
     secret: []const u8,
     token: []const u8,
     now: i64,
-) !void {
+) !Claims {
     const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return error.InvalidToken;
     const second_dot_relative = std.mem.indexOfScalar(u8, token[first_dot + 1 ..], '.') orelse
         return error.InvalidToken;
@@ -102,6 +104,12 @@ pub fn verifyToken(
     if (claims.exp <= now) {
         return error.ExpiredToken;
     }
+
+    return .{
+        .sub = try allocator.dupe(u8, claims.sub),
+        .iat = claims.iat,
+        .exp = claims.exp,
+    };
 }
 
 fn createToken(
@@ -146,4 +154,28 @@ fn decodeAlloc(allocator: Allocator, input: []const u8) ![]u8 {
 
     try base64url.Decoder.decode(output, input);
     return output;
+}
+
+test "verifyToken returns the claims of an issued token" {
+    const allocator = std.testing.allocator;
+    const token = try issueToken(allocator, "secret", "alice", 1000);
+    defer allocator.free(token);
+
+    const claims = try verifyToken(allocator, "secret", token, 1001);
+    defer allocator.free(claims.sub);
+    try std.testing.expectEqualStrings("alice", claims.sub);
+    try std.testing.expectEqual(1000, claims.iat);
+    try std.testing.expectEqual(1000 + token_lifetime_seconds, claims.exp);
+}
+
+test "verifyToken rejects a wrong secret and an expired token" {
+    const allocator = std.testing.allocator;
+    const token = try issueToken(allocator, "secret", "alice", 1000);
+    defer allocator.free(token);
+
+    try std.testing.expectError(error.InvalidToken, verifyToken(allocator, "other", token, 1001));
+    try std.testing.expectError(
+        error.ExpiredToken,
+        verifyToken(allocator, "secret", token, 1000 + token_lifetime_seconds),
+    );
 }
