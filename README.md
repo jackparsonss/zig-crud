@@ -3,7 +3,7 @@ A simple CRUD API for learning Zig. It uses PostgreSQL for storage, Argon2id
 for password hashing, and a dependency-free HS256 JWT implementation built
 with Zig's standard library.
 
-Start PostgreSQL and the API:
+Requires Zig 0.17. Start PostgreSQL and the API:
 
 ```sh
 docker compose up -d
