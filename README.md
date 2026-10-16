@@ -39,3 +39,18 @@ curl -sS http://127.0.0.1:8080/whoami \
 Tokens expire after one hour. `JWT_SECRET` is required when the application
 starts. The Dockerfile supplies `super-secret` as a development default; it
 must be overridden with a strong secret in production.
+
+## Load testing
+
+`loadtest/` is a small Go load generator. It only sends requests that every
+version of this API handles the same way, so the numbers compare directly
+across builds. Start a server built with `-Doptimize=ReleaseFast`, then:
+
+```sh
+go -C loadtest run .                           # 64 connections, 10s per scenario
+go -C loadtest run . -c 256 -scenarios whoami  # see -h for all flags
+```
+
+The `create` scenario inserts a row per request. The load generator competes
+with the server for CPU when run on the same machine, so for numbers near the
+top end run it from another host with `-url`.
