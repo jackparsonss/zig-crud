@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var pool = try pg.Pool.init(io, init.gpa, .{
-        .size = 5,
+        .size = 64,
         .connect = .{ .host = "127.0.0.1", .port = 5432 },
         .auth = .{
             .username = "postgres",
@@ -65,9 +65,12 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Listening on http://127.0.0.1:8080\n", .{});
 
+    var connections: Io.Group = .init;
+    defer connections.cancel(io);
+
     while (true) {
         const stream = try server.accept(io);
-        handleConnection(io, stream, &app);
+        try connections.concurrent(io, handleConnection, .{ io, stream, &app });
     }
 }
 
