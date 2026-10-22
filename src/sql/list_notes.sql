@@ -1,3 +1,4 @@
 SELECT id, text
 FROM notes
-ORDER BY id;
+ORDER BY id
+LIMIT 100;

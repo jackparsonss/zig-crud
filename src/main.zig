@@ -77,6 +77,9 @@ pub fn main(init: std.process.Init) !void {
 fn handleConnection(io: Io, stream: net.Stream, app: *App) void {
     defer stream.close(io);
 
+    const on: c_int = 1;
+    std.posix.setsockopt(stream.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&on)) catch {};
+
     var read_buffer: [4096]u8 = undefined;
     var write_buffer: [4096]u8 = undefined;
     var connection_reader = stream.reader(io, &read_buffer);
@@ -202,9 +205,10 @@ fn createUser(request: *std.http.Server.Request, app: *App) !void {
         &password_hash_buffer,
     );
 
-    var row = (try app.pool.row(
+    var row = (try app.pool.rowOpts(
         @embedFile("sql/create_user.sql"),
         .{ credentials.username, password_hash },
+        .{ .cache_name = "create_user" },
     )) orelse {
         return respondJson(
             request,
@@ -251,9 +255,10 @@ fn login(request: *std.http.Server.Request, app: *App) !void {
         );
     }
 
-    var row = (try app.pool.row(
+    var row = (try app.pool.rowOpts(
         @embedFile("sql/get_user.sql"),
         .{credentials.username},
+        .{ .cache_name = "get_user" },
     )) orelse return respondInvalidUser(request);
     defer row.deinit() catch {};
 
@@ -338,7 +343,7 @@ fn respondUnauthorized(request: *std.http.Server.Request) !void {
 }
 
 fn listNotes(request: *std.http.Server.Request, app: *App) !void {
-    var result = try app.pool.query(@embedFile("sql/list_notes.sql"), .{});
+    var result = try app.pool.queryOpts(@embedFile("sql/list_notes.sql"), .{}, .{ .cache_name = "list_notes" });
     defer result.deinit();
 
     var notes: std.ArrayList(Note) = .empty;
@@ -356,7 +361,7 @@ fn listNotes(request: *std.http.Server.Request, app: *App) !void {
 }
 
 fn getNote(request: *std.http.Server.Request, app: *App, id: u32) !void {
-    var row = (try app.pool.row(@embedFile("sql/get_note.sql"), .{id})) orelse {
+    var row = (try app.pool.rowOpts(@embedFile("sql/get_note.sql"), .{id}, .{ .cache_name = "get_note" })) orelse {
         return respondJson(request, .not_found, "{\"error\":\"note not found\"}");
     };
     defer row.deinit() catch {};
@@ -369,7 +374,7 @@ fn createNote(request: *std.http.Server.Request, app: *App) !void {
     defer app.allocator.free(text);
     if (text.len == 0) return respondJson(request, .bad_request, "{\"error\":\"request body is empty\"}");
 
-    var row = (try app.pool.row(@embedFile("sql/create_note.sql"), .{text})) orelse return error.QueryFailed;
+    var row = (try app.pool.rowOpts(@embedFile("sql/create_note.sql"), .{text}, .{ .cache_name = "create_note" })) orelse return error.QueryFailed;
     defer row.deinit() catch {};
 
     try respondNote(request, app, &row, .created);
@@ -382,7 +387,7 @@ fn updateNote(request: *std.http.Server.Request, app: *App, id: u32) !void {
         return respondJson(request, .bad_request, "{\"error\":\"request body is empty\"}");
     }
 
-    var row = (try app.pool.row(@embedFile("sql/update_note.sql"), .{ text, id })) orelse {
+    var row = (try app.pool.rowOpts(@embedFile("sql/update_note.sql"), .{ text, id }, .{ .cache_name = "update_note" })) orelse {
         return respondJson(request, .not_found, "{\"error\":\"note not found\"}");
     };
     defer row.deinit() catch {};
@@ -391,7 +396,7 @@ fn updateNote(request: *std.http.Server.Request, app: *App, id: u32) !void {
 }
 
 fn deleteNote(request: *std.http.Server.Request, app: *App, id: u32) !void {
-    const affected = try app.pool.exec(@embedFile("sql/delete_note.sql"), .{id});
+    const affected = try app.pool.execOpts(@embedFile("sql/delete_note.sql"), .{id}, .{ .cache_name = "delete_note" });
     if ((affected orelse 0) == 0) {
         return respondJson(request, .not_found, "{\"error\":\"note not found\"}");
     }
